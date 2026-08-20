@@ -46,12 +46,16 @@ pip install requests
 cd x && python a.py
 ( python a.py ) &
 FOO=1 python main.py
+pipx install ruff
+python -m venv .venv
+source .venv/bin/activate
+echo $(python -c 'x')
 ```
 
 Each produces a message like:
 
 ```
-BLOCKED by uv-enforce: direct 'python' is forbidden in this workspace
+BLOCKED by uv-enforce: 'python' is forbidden in this workspace
 (all Python runs through 'uv'). Rewrite and retry:
 'python script.py'  ->  'uv run python script.py'
 ```
@@ -60,15 +64,18 @@ For `pip` the guidance lists all valid rewrites (`uv add`, `uv run --with`, and 
 
 ### Allowed (not blocked)
 
-These are allowed because the forbidden words are **not** in command position:
+Each case below is allowed because the forbidden words are not **actual commands**, or the action is uv-managed / not a policy violation:
 
 ```bash
-uv run python main.py      # python is an argument to uv run
+uv run python main.py       # python is an argument to uv run
 grep python README.md       # argument
 echo "run python here"      # inside a quoted string
 # a python code note        # comment
 pythonic                    # different word
 alias python=x              # alias target, not a command
+uv run pip install X        # uv-managed, fine
+cd venv                     # 'venv' as a file/dir name, not venv creation
+source .bashrc              # 'activate' suffix only; .bashrc is allowed
 ```
 
 ---
@@ -87,7 +94,7 @@ alias python=x              # alias target, not a command
 ## Limitations
 
 - **`bash` tool only** — enforcement happens at execution time and only for the `bash` tool. It does not inspect `write` / `edit` / `read` tool content, so a script *containing* a forbidden command is not flagged at authoring time.
-- **Coverage gaps vs. the policy** — only the four command names are caught. Other policy-prohibited patterns from `AGENTS.md` (`python -m venv`, `source .venv/bin/activate`, `pipx`) are not detected.
+- **Coverage gaps vs. the policy** — the core policy-prohibited patterns are now all caught (direct commands, `pipx`, `python -m venv`, `source .venv/bin/activate`, `$(python ...)`). Remaining gaps are the shell-parser cases listed below, which are accepted for a cooperative-agent context.
 - **Not a real shell parser** — it models a subset of shell word-expansion (quotes, comments, whitespace, basic operators). Theses are **known, accepted gaps** for a cooperative-agent context:
   - **Backslash escapes** — `` `pyth\on script.py` `` (shell resolves `\` to `python`, detector sees `pyth\on`) are not flagged.
   - **Parameter expansion / command substitution** — `$PY script.py`, `$(python ...)`, `command python`, `sudo python`, `env python` are not modeled.
@@ -97,16 +104,6 @@ alias python=x              # alias target, not a command
 - **Policy/constraint drift risk** — the teaching strings are hard-coded in the extension rather than read from `AGENTS.md`, so the two documents must be kept in sync manually.
 
 > **Note on evasion-style gaps:** backslash escapes and shell expansion are *deliberate* bypass attempts. This extension is intended as a **policy reminder and safeguard for a cooperative agent** — not a security sandbox. A model that deliberately works around it can always find another escape; hardening against adversarial evasion is out of scope and not worth the complexity.
-
----
-
-## Suggested future improvements
-
-- Catch the remaining explicit policy patterns: `python -m venv`, `source .../activate`, `pipx`, `$(python ...)`.
-- Add an **override / allowlist** mechanism (e.g., a per-path or comment-based opt-out) for mixed-language workspaces.
-- Add **repeat-offense escalation** — after N identical blocks, escalate to `terminate: true` or auto-rewrite via `event.input.command` mutation.
-- Resolve **backslash escapes** and basic wrappers (`sudo`/`env`/`$(...)`) in the tokenizer — cheap to add, though low real-world value.
-- Sweep `write` / `edit` tool content with a non-blocking warning to catch violations at authoring time.
 
 ---
 
