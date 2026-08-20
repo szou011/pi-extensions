@@ -2,8 +2,8 @@
  * uv-enforce.ts
  *
  * Enforces the workspace's "uv only" Python policy (see AGENTS.md) inside pi by
- * HARD-BLOCKING any `bash` tool call that invokes `python` / `python3` / `pip` /
- * `pip3` as a real command. Enforcement is made visible to BOTH:
+ * HARD-BLOCKING any `bash` tool call that runs Python directly (outside `uv`).
+ * Enforcement is made visible to BOTH:
  *
  *   - the AGENT: the bash tool returns a blocked error containing an explicit,
  *     copy-pasteable uv rewrite, so the model learns the rule;
@@ -14,14 +14,26 @@
  * `grep python file`, `echo "run python"`, or a `# python note` comment does
  * NOT trigger a false positive.
  *
+ * Detected violations:
+ *   - direct commands: `python`, `python3`, `pip`, `pip3`, `pipx`;
+ *   - manual venv creation: `python -m venv .venv` (only when `python` is the
+ *     actual command, so `uv run python -m venv` stays allowed);
+ *   - manual venv activation: `source .venv/bin/activate` / `. .../activate`;
+ *   - command substitution `$(python ...)` (caught because the `(` operator
+ *     resets the scanner to command position).
+ *
  * Loaded from `.pi/extensions/` (project-local, auto-discovered after trust).
  * Hot-reload with the `/reload` command.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 
-/** Commands that must never run directly. */
+/** Direct commands that must never run. */
 const FORBIDDEN = new Set(["python", "python3", "pip", "pip3"]);
+/** Commands that must never be the leading word of a command. */
+const FORBIDDEN_LEADERS = new Set(["pipx"]);
+/** Bash operators that separate simple commands; after one, expect a command. */
+const COMMAND_OPERATORS = new Set(["&&", "||", ";", "|", "&", "("]);
 
 /**
  * The teaching message returned as the tool error (visible to the agent) and
@@ -29,6 +41,21 @@ const FORBIDDEN = new Set(["python", "python3", "pip", "pip3"]);
  * idiom described in AGENTS.md.
  */
 function guidance(tok: string): string {
+	if (tok === "python -m venv") {
+		return [
+			`'python -m venv .venv'  ->  let 'uv run' manage the project env (uv creates/uses .venv automatically)`,
+			`'python -m venv .venv'  ->  'uv init' + 'uv run ...' for a fresh project`,
+		].join("  |  ");
+	}
+	if (tok === "source .../activate") {
+		return `no manual activation: 'source .venv/bin/activate'  ->  'uv run <cmd>' already uses the locked project env`;
+	}
+	if (tok === "pipx") {
+		return [
+			`'pipx install X'  ->  'uvx X'  (one-off)`,
+			`'pipx install X'  ->  'uv tool install X'  (persistent)`,
+		].join("  |  ");
+	}
 	// pip has several valid rewrites; present all.
 	if (tok.startsWith("pip")) {
 		return [
@@ -50,14 +77,14 @@ export default function (pi: ExtensionAPI) {
 		if (!bad) return; // no genuine python/pip invocation -> allow
 
 		const reason =
-			`BLOCKED by uv-enforce: direct '${bad.token}' is forbidden in this workspace ` +
+			`BLOCKED by uv-enforce: '${bad.token}' is forbidden in this workspace ` +
 			`(all Python runs through 'uv'). Rewrite and retry:\n` +
 			guidance(bad.token);
 
 		// Human-visible enforcement notification: the viewer sees each block and
 		// the teaching guidance, so enforcement is auditable in real time.
 		if (ctx.hasUI) {
-			ctx.ui.notify(`uv-enforce: blocked direct \`${bad.token}\`; agent was asked to rewrite to uv`, "warning");
+			ctx.ui.notify(`uv-enforce: blocked \`${bad.token}\`; agent was asked to rewrite to uv`, "warning");
 		}
 
 		// Agent-visible: the bash tool reports this as an error result.
@@ -72,8 +99,10 @@ const spaces = /\s+/;
 /**
  * Splits a whitespace-delimited token on literal `&&`, `||`, `;`, `|`, `&`,
  * `(`, `)`. These are bash operators that may be glued to neighboring words
- * (e.g. `(python a.py)`, `x&`, `a&&b`). Breaking them out lets the command
- * detector see `python` as a real command position instead of a run-on token.
+ * (e.g. `(python a.py)`, `x&`, `a&&b`, `$(python ...)` -> `$` + `(` + `python`).
+ * Breaking them out lets the detector see `python` as a real command position
+ * instead of a run-on token, and lets the `(` operator reset the scanner for
+ * command substitutions.
  */
 function splitOperators(tok: string): string[] {
 	return tok.split(/(&&|\|\||;|\||&|\(|\))/).filter(Boolean);
@@ -81,33 +110,43 @@ function splitOperators(tok: string): string[] {
 
 /**
  * Tokenizes the quote/comment-stripped command into whitespace-delimited words
- * (keeping `&&`, `||`, `;`, `|` operators as tokens so we can detect command
- * boundaries) and returns the first forbidden token that is the ACTUAL command
- * being run — i.e. the first non-operator, non-env-assignment word of a
- * sub-command.
+ * (keeping bash operators as tokens) and walks them with simple-command-aware
+ * position tracking. Returns the first forbidden token, describing the ACTUAL
+ * command being run, or undefined.
+ *
+ * Detection logic per word:
+ *   - after a `&&`/`||`/`;`/`|`/`&`/`(` operator, or an env-assignment prefix,
+ *     the next word must be a command;
+ *   - at command position: a forbidden command name/leader blocks; `python -m
+ *     venv` gets a specific manual-venv message; `source`/`.` mark that the next
+ *     arg activates a venv;
+ *   - in argument position: `python`/`pip` are allowed (e.g. `uv run python`,
+ *     `uv run pip install`); only an activation path (`.../activate`) blocks.
  *
  * This means `grep python file.txt`, `alias python=x`, `echo "use python"`,
- * `pythonic`, and valid `uv run python main.py` are NOT blocked, while
- * `python script.py`, `cd x && python a.py`, `FOO=1 python`, and
- * `(python a.py) &` ARE blocked.
+ * `pythonic`, `uv run python main.py`, `uv run pip install X`, `cd venv`, and
+ * `grep activate file` are NOT blocked, while `python script.py`,
+ * `cd x && python a.py`, `FOO=1 python`, `(python a.py) &`, `pipx install X`,
+ * `python -m venv .venv`, `source .venv/bin/activate`, and `$(python -c ...)`
+ * ARE blocked.
  */
 function scanForForbiddenCommand(command: string): Forbidden {
-	const stripped = stripQuotesAndComments(command);
+	const text = stripQuotesAndComments(command);
 	// Tokenize: split on whitespace AND on bash operator characters, so
-	// `cd x && python a.py` and `(python a.py)` tokenize into separate
-	// command/argument tokens rather than run-together lumps.
-	const words = stripped.split(spaces).filter(Boolean).map(splitOperators).flat();
+	// `cd x && python a.py`, `(python a.py)`, and `$(python ...)` tokenize into
+	// separate command/argument/operator tokens rather than run-together lumps.
+	const tokens = text.split(spaces).filter(Boolean).map(splitOperators).flat();
 
 	let expectCommand = true; // true when next meaningful word must be a command
+	let sourceBuiltin = false; // true right after a `source` / `.` command
 
-	for (const w of words) {
+	for (let i = 0; i < tokens.length; i++) {
+		const w = tokens[i];
+
 		// Command operators reset the position so the next word is a command.
-		if (w === "&&" || w === "||") {
+		if (COMMAND_OPERATORS.has(w)) {
 			expectCommand = true;
-			continue;
-		}
-		if (w === ";" || w === "|" || w === "(" || w === "&") {
-			expectCommand = true;
+			sourceBuiltin = false;
 			continue;
 		}
 		if (w === ")") {
@@ -116,17 +155,37 @@ function scanForForbiddenCommand(command: string): Forbidden {
 
 		// Skip env-assignment prefixes (FOO=1 / VAR=value) when at command spot.
 		if (expectCommand && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+			sourceBuiltin = false;
 			continue; // still expectCommand for the real command after them
 		}
 
-		// If we're at a command position and this word is forbidden -> block.
-		if (expectCommand && FORBIDDEN.has(w)) {
-			return { token: w };
+		if (expectCommand) {
+			expectCommand = false;
+			sourceBuiltin = w === "source" || w === ".";
+
+			// Manual venv creation gets a specific, teaching message. Only match
+			// when python is genuinely the command, so `uv run python -m venv`
+			// (python as an argument) stays allowed.
+			if ((w === "python" || w === "python3") && tokens[i + 1] === "-m" && tokens[i + 2] === "venv") {
+				return { token: "python -m venv" };
+			}
+
+			// Direct forbidden command, or a forbidden leader like pipx.
+			if (FORBIDDEN.has(w) || FORBIDDEN_LEADERS.has(w)) {
+				return { token: w };
+			}
+			continue;
 		}
 
-		// Any other word (the command itself, or an argument) means subsequent
-		// words in this simple-command are arguments, not commands.
-		expectCommand = false;
+		// Argument position: python/pip are fine (uv run python, uv run pip).
+		// Only a venv activation path is forbidden here. `$(` closes via the `(`
+		// operator, so a genuine `$(python ...)` sub-command is caught above.
+		if (w.endsWith("/activate") || (sourceBuiltin && w === "activate")) {
+			return { token: "source .../activate" };
+		}
+		// After the first argument of a source command, `source x && ...`: the
+		// next command is handled by the operator reset above.
+		sourceBuiltin = false;
 	}
 
 	return undefined;
@@ -135,7 +194,8 @@ function scanForForbiddenCommand(command: string): Forbidden {
 /**
  * Removes everything inside single/double quotes and from `#` to end-of-line,
  * so the tokenizer only sees literal command/argument words that bash would
- * actually attempt to run.
+ * actually attempt to run. (Backslash escapes are deliberately not resolved;
+ * see README: this targets a cooperative agent, not adversarial evasion.)
  */
 function stripQuotesAndComments(s: string): string {
 	let out = "";
